@@ -11,4 +11,4 @@ See comments in code for more information.
 ## 3. Other files
 All other files are used in the analysis scripts.  
 * `combat.R` and `utils.R` are used for ComBat harmonization (see https://github.com/Jfortin1/ComBatHarmonization).  
-*`Rainclouds.R` (for figure 3)
+* `Rainclouds.R` (for figure 3)
