@@ -1,5 +1,7 @@
 # Larsen_IronDevelopment
 
+This repository contains the analysis code for "Longitudinal development of brain iron is linked to cognition in youth" (Larsen et al., 2019).
+
 ## 1. createT2star.sh
 This code snippet contains bash code to calculate T2* and R2* and spatially normalize them to the study template.
 
