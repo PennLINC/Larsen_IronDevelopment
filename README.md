@@ -9,4 +9,6 @@ The code reads in the data file brain_iron_data.Rda .
 See comments in code for more information.
 
 ## 3. Other files
-All other files, `combat.R` (for ComBat harmonization), `utils.R` (for ComBat harmonization), `Rainclouds.R` (for figure 3), are used in the analysis scripts.
+All other files are used in the analysis scripts.  
+* `combat.R` and `utils.R` are used for ComBat harmonization (see https://github.com/Jfortin1/ComBatHarmonization).  
+*`Rainclouds.R` (for figure 3)
