@@ -1,0 +1,865 @@
+---
+title: "Analysis Code"
+author: "Bart Larsen"
+date: "10/10/2019"
+output:
+  html_document: default
+  toc: yes
+---
+
+This code implements all statistical analyses and creates figures for "Longitudinal development of brain iron is linked to cognition in youth" (Larsen, et al., 2019).
+
+---
+
+```{r setup, include=FALSE}
+## Load Libraries
+require(ggplot2)
+require(gridExtra)
+library(cowplot)
+require(tidyverse)
+require(mgcv)
+require(gratia)
+require(pbkrtest)
+library(broom)
+library(kableExtra)
+library(parallel)
+library(scales)
+source('combat.R')
+source('utils.R')
+font_size <- 16
+theme_set(theme_classic(base_family = "sans",base_size = font_size))
+line_size <- 1.5
+point_size <- 2
+
+```
+
+## Relevant functions:
+### GAMM modeling
+```{r gamm}
+# This function:
+# 1. executes the GAMM model,
+# 2. sends output to the parametric bootstrap (if requested),
+# 3. prints a regression table, and 
+# 4. sends the model to the visualizer for plotting.
+
+gamm_model <- function(df, model_formula, this_label, smooth_var, int_var = NULL,group_var, pbootstrap = F, longPlot = F, model_test = T){
+  cat(sprintf("\n\n### Results for %s\n",this_label))
+  
+ model_formula <- as.formula(model_formula)
+  if(!"exclusions" %in% colnames(df))  {
+    df$exclusions <- FALSE; #there is no exclusions column so make one that excludes none
+  }
+  g1<-gamm(model_formula,
+           data=df,
+           random = list(bblid =~ 1),
+           subset = exclusions == F)
+  
+  if (model_test == T){
+    if (pbootstrap == T) {
+      #Send to bootstrap function
+      g1$pb<-pboot(g1) 
+      #Print a table that shows the bootstrap outcome
+      print(g1$pb %>%
+        summary() %>%
+        .$test %>%
+        as.data.frame() %>%
+        kable(caption = sprintf("Parametric Bootstrap test for %s",this_label)) %>%
+        kable_styling(full_width = F, position = "left",bootstrap_options = c("striped"))
+      )
+      
+      if (isTRUE(all.equal(g1$pb$bestmod,model_formula))) {
+        cat("The initial (more complicated) model is best")
+        g <- g1
+        
+        # Refit the model without fixed df for the purpose of plotting
+        plot_formula <- as.formula(gsub(", fx = T","",deparse(model_formula)))
+        cat(deparse(plot_formula))
+        plotg<-g
+        plotg <- gamm(plot_formula,
+                      data = df,
+                      random = list(bblid =~1),
+                      subset = exclusions == F)
+      } else {
+        cat("The simpler model is best")
+        cat("   refitting  ")
+        g <-gamm(as.formula(g1$pb$bestmod),
+                 data=df,
+                 random = list(bblid =~ 1),
+                 subset = exclusions == F)
+        
+        #Again, this part not implemented (model not refit with unfixed df)
+        plot_formula <- as.formula(gsub("ti\\(",'te\\(',deparse(g$gam$formula)) %>% gsub(", fx = T", "", .))
+        plotg<-g
+        plotg <-gamm(plot_formula,
+                 data=df,
+                 random = list(bblid =~ 1),
+                 subset = exclusions == F)
+      }
+    } else {
+      if (!is.null(int_var)) {
+        # We are not bootstrapping, but there is an interaction variable
+        s<-summary(g1$gam)
+        if (s$s.table[grep(x=rownames(s$s.table),pattern = int_var),"p-value"] <.05/4)  {
+          #Checked if interaction is sig, if so keep in the model
+          g <- g1
+          plot_formula <- as.formula(gsub(", fx = T", "", deparse(model_formula)))
+          plotg <- g
+        } else {
+          #Interaction is not sig, remove from the model
+          cat("The simpler model is best")
+          thisResp <- as.character(g1$gam$terms[[2]])
+          theseVars <- attr(terms(model_formula),"term.labels")
+          new_formula <- reformulate(theseVars[0:(length(theseVars)-1)],response = thisResp)
+          
+          g <-gamm(as.formula(new_formula),
+                   data=df,
+                   random = list(bblid =~ 1),
+                   subset = exclusions == F)
+          plot_formula <- as.formula(gsub("ti\\(",'te\\(',deparse(g$gam$formula)) %>% gsub(", fx = T", "", .))
+          plotg<-gamm(as.formula(plot_formula),
+                   data=df,
+                   random = list(bblid =~ 1),
+                   subset = exclusions == F)
+      }
+      } else {
+        #There is no interaction term, just plot.
+        g <- g1
+          plot_formula <- as.formula(gsub(", fx = T", "", deparse(model_formula)))
+          plotg <-gamm(as.formula(plot_formula),
+                   data=df,
+                   random = list(bblid =~ 1),
+                   subset = exclusions == F)
+      }
+    }
+  } else {
+    g <- g1
+    plotg<-g
+  }
+
+  g$gam$data<-df %>%
+    filter(exclusions == F)
+  
+  #Display model results:
+  s_tidytable<- tidy(g$gam)
+  p_tidytable <- tidy(g$gam,parametric = T)
+  snames = names(s_tidytable)
+  pnames = names(p_tidytable)
+  names(s_tidytable)=pnames
+  thisBIC <- BIC(g$lme)
+  numObs <- g$lme$dims$N
+  g$BIC <- thisBIC
+  print(concurvity(g$gam)%>%kable(caption = "convurvity")%>%kable_styling(full_width = F,bootstrap_options = "striped",position = "left"))
+  stattable <- rbind(p_tidytable,snames,s_tidytable) %>%
+    kable(caption = sprintf("Regression table from gamm in %s, BIC = %1.2f, obs = %d",this_label,thisBIC,numObs)) %>% 
+    kable_styling(full_width = F, position = "left")
+  
+  print(stattable)
+  write.csv(x = rbind(p_tidytable,snames,s_tidytable),file = sprintf("GAMM_table_%s.csv",this_label),row.names = F)
+  cat(sprintf("Regression table from gamm in %s, BIC = %1.2f, obs = %d\n",this_label,thisBIC,numObs),
+      file = sprintf("GAMM_table_%s.txt",this_label))
+  cat(sprintf("Bootstrap p value %1.5f",g1$pb$test["PBtest","p.value"]),
+      file = sprintf("GAMM_table_%s.txt",this_label),
+      append = T)
+
+
+  #Send final model to visualizer:
+  if (longPlot == T) {
+      g$pl <- longitudinal_plot(g,plabels = this_label)
+    } else{
+    if (s_tidytable$p.value[nrow(s_tidytable)]<1.05) {
+        g$pl <- visualize_models(plotg,plabels = this_label, smooth_var = smooth_var, int_var = int_var, group_var = group_var)
+    }
+    }
+  #Return result object
+  result <- g
+  
+  return(result)
+}
+```
+
+### Bootstrap procedure
+```{r include=T,opts.label = "Bootstrap Function"}
+## Parametric bootstrap of likelihood ratio test for nested models
+pboot <- function(modelobj){
+  numsims <- 1000
+
+  df <- modelobj$gam$model
+  thisResp <- as.character(modelobj$gam$terms[[2]])
+  f1 <- modelobj$gam$formula
+  theseVars <- attr(terms(f1),"term.labels")
+  f2 <- reformulate(theseVars[0:(length(theseVars)-1)],response = thisResp)
+  
+  g1 <- gam(f1,data = df)
+  g2 <- gam(f2,data = df)
+
+  mat1 <- model.matrix(g1)
+  mat2 <- model.matrix(g2)
+
+  bblid<-df$bblid
+  y <- df[,thisResp]
+  
+  m1 <- lmer(y ~ -1 + mat1 + (1|bblid))
+  m2 <- lmer(y ~ -1 + mat2 + (1|bblid))
+  refdist <- PBrefdist(m1, m2, nsim=numsims)#, cl=cl)
+  pb <- PBmodcomp(m1, m2, ref = refdist)
+  int_pval <- pb$test["PBtest","p.value"]
+  if (int_pval < .05/4) {
+    pb$bestmod <- f1
+  } else {
+    pb$bestmod <- f2
+  }
+  return(pb)
+}
+```
+
+### Visualize models
+```{r visual func, include=FALSE}
+# Func to visualize model outputs
+visualize_models <- function(modobj,smooth_var, int_var ,group_var, plabels = NULL,check_diagnostics = F){
+  if (any(class(modobj)=="gam")) {
+    model <- modobj
+  } else if (class(modobj$gam)=="gam") {
+    model <- modobj$gam
+  } else {
+    stop("Can't find a gam object to plot")
+  }
+
+  ## Generate custom line plot
+  np <- 10000 #number of predicted values
+  df = model$model
+
+  theseVars <- attr(model$terms,"term.labels")
+  varClasses <- attr(model$terms,"dataClasses")
+  thisResp <- as.character(model$terms[[2]])
+
+  if (!is.null(int_var)) {
+    if (!any(grepl(x=as.character(model$formula),pattern = int_var))) {
+      return()
+    }
+    switch (varClasses[int_var],
+      "numeric" = {
+        q <- quantile(df[,int_var],probs = c(.05,.95)) #pick 10% and 90% to plot
+        bigq <- q[[2]]
+        smallq <- q[[1]]
+        values <- c(bigq,smallq)
+        labs <- c(sprintf("high (%1.2f)",bigq),sprintf("low (%1.2f)",smallq))
+
+        q <-quantile(rescale(df[,int_var],c(0,1)),probs = c(.05,.5,.95))
+        limit_values <- c(q[[1]],q[[length(q)]])
+        midpoint_val <- unname(q[[2]])
+        
+        grad_fill = T
+      },
+      "factor" = {
+        labs <- levels(df[,int_var])
+        values <- levels(df[,int_var])
+        grad_fill = F
+      },
+      "ordered" = {
+        labs <- levels(df[,int_var])
+        values <- levels(df[,int_var])
+        grad_fill = F
+      }
+    )
+
+    labPred <- data.frame(init = rep(0,np*length(labs)))
+    labPred[,int_var] = rep(values,each = np)
+    labPred$lab = rep(labs,each = np)
+    labPred <- labPred[,names(labPred) !="init"]
+    thisPred <- data.frame(init = rep(0,np))
+    
+    for (v in c(1:length(theseVars))) {
+      thisVar <- theseVars[[v]]
+      thisClass <- varClasses[thisVar]
+      if (thisVar == smooth_var) {
+        thisPred[,smooth_var] = seq(min(df[,smooth_var],na.rm = T),max(df[,smooth_var],na.rm = T), length.out = np)
+      } else if (v == int_var) {
+        next
+      } else {
+        switch (thisClass,
+            "numeric" = {thisPred[,thisVar] = median(df[,thisVar])},
+            "factor" = {thisPred[,thisVar] = levels(df[,thisVar])[[1]]},
+            "ordered" = {thisPred[,thisVar] = levels(df[,thisVar])[[1]]}
+              )
+      }
+    }
+
+    thisPred <- thisPred %>% select(-init)
+    thisPred <- do.call("rbind", replicate(length(labs), thisPred, simplify = FALSE))
+
+    pred <- cbind(labPred,thisPred)
+    p<-data.frame(predict(modobj$gam,pred,se.fit = T))
+    pred <- cbind(pred,p)
+    pred$selo <- pred$fit - 2*pred$se.fit
+    pred$sehi <- pred$fit + 2*pred$se.fit
+    pred[,group_var] = NA
+    pred[,thisResp] = 1
+
+    low_color = "#91bfdb"
+    high_color = "#fc8d59" 
+    high_line = "#f46d43"
+    low_line = "#4575b4"
+    if (grad_fill == T) {
+      p1 <- ggplot(data = df, aes_string(x = smooth_var,y = thisResp, color = int_var)) +
+      geom_point(alpha = 0.85,stroke = 0, size = point_size) + geom_line(aes(group = bblid),alpha = .75 ) +
+      scale_color_gradientn(colors = c(low_line,low_color,'grey90',high_color,high_line), limits = c(-2,2),values=c(0,.25,.5,.75,1),oob=squish,name = "") +
+      geom_ribbon(data = pred,aes_string(x = smooth_var , ymin = "selo",ymax = "sehi", fill = "lab"),alpha = .18, linetype = 0) +
+      scale_fill_manual(values = c(high_color,low_color)) +
+      geom_line(data = pred,aes_string(x = smooth_var, y = "fit",group = "lab"),size = line_size) +
+      labs(title = plabels, y = "R2* (1/sec)", x = "Age (years)", col = int_var)
+    } else {
+
+    p1 <- ggplot(data = df, aes_string(x = smooth_var,y = thisResp, color = int_var)) +
+      geom_point(alpha = .35,stroke = 0, size = point_size) + geom_line(aes(group = bblid),alpha = .3) +
+      scale_color_brewer(type = "qual",palette = 6,direction = -1) +
+      geom_ribbon(data = pred,aes_string(x = smooth_var , ymin = "selo",ymax = "sehi", fill = int_var),alpha = .5, linetype = 0) +
+      scale_fill_brewer(type = "qual",palette = 6,direction = -1) +
+      geom_line(data = pred,aes_string(x = smooth_var, y = "fit",color = int_var),size = line_size) +
+      scale_color_brewer(type = "qual",palette = 6,direction = -1) +
+      labs(title = plabels, y = "R2* (1/sec)", x = "Age (years)")
+    }
+    if (str_detect(plabels,"Accumbens")) {
+      p1 <- p1 + ylim(10,30)
+    } else if (str_detect(plabels,"Pallidum")) {
+      p1 <- p1 + ylim(15,30)
+    } else if (any(str_detect(plabels,c("Putamen","Caudate")))) {
+      p1 <- p1 + ylim(12,22)
+    }
+    p1<- p1+theme(text = element_text(size=font_size),
+                axis.text = element_text(size = font_size,colour = "black"),
+                legend.text = element_text(size = font_size),
+                panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank(),
+                panel.background = element_blank(),
+                plot.background = element_blank())
+    print(p1)
+  } else {
+
+  # line plot with no interaction
+    thisPred <- data.frame(init = rep(0,np))
+
+    for (v in c(1:length(theseVars))) {
+      thisVar <- theseVars[[v]]
+      thisClass <- varClasses[thisVar]
+      if (thisVar == smooth_var) {
+        thisPred[,smooth_var] = seq(min(df[,smooth_var],na.rm = T),max(df[,smooth_var],na.rm = T), length.out = np)
+      } else {
+        switch (thisClass,
+            "numeric" = {thisPred[,thisVar] = median(df[,thisVar])},
+            "factor" = {thisPred[,thisVar] = levels(df[,thisVar])[[1]]},
+            "ordered" = {thisPred[,thisVar] = levels(df[,thisVar])[[1]]}
+              )
+      }
+    }
+    pred <- thisPred %>% select(-init)
+    p<-data.frame(predict(modobj$gam,pred,se.fit = T))
+    pred <- cbind(pred,p)
+    pred$selo <- pred$fit - 2*pred$se.fit
+    pred$sehi <- pred$fit + 2*pred$se.fit
+    pred[,group_var] = NA
+    pred[,thisResp] = 1
+
+    pl <- ggplot(data = df, aes_string(x = smooth_var,y = thisResp)) +
+      geom_point(alpha = .3,stroke = 0, size = point_size) + geom_line(aes(group = bblid),alpha = .3) +
+      geom_ribbon(data = pred,aes_string(x = smooth_var , ymin = "selo",ymax = "sehi"),alpha = .5, linetype = 0) +
+      geom_line(data = pred,aes_string(x = smooth_var, y = "fit"),size = line_size) +
+      labs(title = plabels, y = "R2*", x = smooth_var)
+    if (str_detect(plabels,"Accumbens")) {
+      pl <- pl + ylim(10,30)
+    } else if (str_detect(plabels,"Pallidum")) {
+      pl <- pl + ylim(15,30)
+    } else if (any(str_detect(plabels,c("Putamen","Caudate")))) {
+      pl <- pl + ylim(12,22)
+    }
+    p1<-pl
+  }
+  
+  if (check_diagnostics == T) {
+    cp <- check(b,
+    a.qq = list(method = "tnorm",
+                a.cipoly = list(fill = "light blue")),
+    a.respoi = list(size = 0.5),
+    a.hist = list(bins = 10))
+    print(cp)
+  }
+
+  return(p1)
+}
+```
+
+```{r long vis, include = FALSE,fig.height=5,fig.width=3,warning=F}
+# Special case for plotting age and age*sex models. Mostly redundant now that the above function exists, but it works and sets colors differently, so it is still used.
+
+# *ALSO CALCULATES DERIVATIVES* 
+longitudinal_plot <- function(modobj,plabels = NULL){
+  df <- modobj$gam$model
+  s<-summary(modobj$gam)
+  thisResp <- as.character(modobj$gam$terms[[2]])
+
+  pred.male <- data.frame(age = seq(min(df$age,na.rm = T),max(df$age,na.rm = T), length.out = 1000), oSex = 'male',sequence = "B0map_onesizefitsall_v3",timepoint = "1",visitnum = "1",oRace_bwo = "white")
+  p<-data.frame(predict(modobj$gam,pred.male,se.fit = T))
+  pred.male$fit = p$fit
+  pred.male$selo = p$fit - 2*p$se.fit
+  pred.male$sehi = p$fit + 2*p$se.fit
+  pred.male[,thisResp] = 1
+  pred.male$bblid=1
+  
+  pred.female <- data.frame(age = seq(min(df$age,na.rm = T),max(df$age,na.rm = T), length.out = 1000), oSex ='female',sequence = "B0map_onesizefitsall_v3",timepoint = "1",visitnum = "1",oRace_bwo = "white")
+  p<-data.frame(predict(modobj$gam,pred.female,se.fit = T))
+  pred.female$fit = p$fit
+  pred.female$selo = p$fit - 2*p$se.fit
+  pred.female$sehi = p$fit + 2*p$se.fit
+  pred.female[,thisResp] = 1
+  pred.female$bblid=1
+
+  female <- "#e41a1c"
+  male <- "#377eb8"
+  # geom_point(alpha = .25) +
+  p1 <- ggplot(data = df,aes_string(x = "age", y = thisResp, group = "bblid",color = "oSex",fill = "oSex")) +
+    geom_line(alpha = .3) + geom_point(alpha = .3,stroke = 0, size = point_size,show.legend = F) +
+    scale_color_manual(values = c(male,female)) +scale_fill_manual(values = c(male,female)) +
+    geom_ribbon(data = pred.male, aes(ymin=selo, ymax=sehi), fill = male, alpha = .2, linetype = 0,show.legend = F) +
+    geom_line(data = pred.male,aes(x = age, y = fit), color = male,size = line_size) +
+    geom_ribbon(data = pred.female, aes(ymin=selo, ymax=sehi), fill = female, alpha = .2, linetype = 0,show.legend = F) +
+    geom_line(data = pred.female,aes(x = age, y = fit), color = female,size = line_size) +
+    labs(title = plabels, y = "R2* (1/sec)", x = "Age (years)", col = "Sex")  + ylim(min(pred.female$selo-.5),NA)+
+    theme(text = element_text(size=font_size))
+if (str_detect(plabels,"Accumbens")) {
+    p1 <- p1 + ylim(10,30)
+  } else if (str_detect(plabels,"Pallidum")) {
+    p1 <- p1 + ylim(10,30)
+  } else if (any(str_detect(plabels,c("Putamen","Caudate")))) {
+    p1 <- p1 + ylim(12,22)
+  }
+
+p1<- p1+theme(text = element_text(size=font_size),
+              axis.text = element_text(size = font_size),
+              axis.title.x = element_blank(),
+              axis.text.x = element_blank(),
+              axis.ticks.x = element_blank(),
+              legend.text = element_text(size = font_size),
+              axis.title = element_text(size = font_size),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              panel.background = element_rect(fill = "transparent",colour = NA),
+              plot.background = element_rect(fill = "transparent",colour = NA),
+              plot.margin = unit(c(.2, .2, 0, .2), "cm")) #Top, left,Bottom, right
+
+#### Add derivative plot
+# function to extract derivative, confidence interval, significance, and plot
+get_derivs_and_plot <- function(modobj,low_color=NULL,hi_color=NULL){
+  if (is.null(low_color)){low_color = "white"}
+  if (is.null(hi_color)){hi_color = "grey20"}
+  derf<-derivatives(modobj)
+  derf<- derf %>%
+    mutate(sig = !(0 >lower & 0 < upper))
+  derf$sig_deriv = derf$derivative*derf$sig
+  cat(sprintf("\nSig change: %1.2f - %1.2f\n",min(derf$data[derf$sig==T]),max(derf$data[derf$sig==T])))
+  d1<- ggplot(data=derf) + geom_tile(aes(x = data, y = .5, fill = sig_deriv)) + 
+    scale_fill_gradient(low = low_color,high = hi_color,limits = c(0,.5),oob = squish)+ #Holding the limit constant across all plots (at .5)
+    labs(x = "Age (years)",fill = "\u0394R2*/Year") + 
+    theme(axis.title.y = element_blank(),
+          axis.text.y = element_blank(),
+          axis.text.x = element_text(size = font_size),
+          axis.line = element_blank(),
+          axis.ticks.y = element_blank(),
+          text = element_text(size=font_size),
+          legend.text = element_text(size = font_size),
+          axis.title = element_text(size = font_size),
+          legend.key.width = unit(.5,"cm"),
+          legend.position = "right",
+          plot.margin = unit(c(0, 0, .2, 0), "cm"))+
+    guides(fill = guide_colorbar(reverse = F,direction = "horizontal",title.position = "top")) +
+    geom_rect(aes(ymin=0,ymax=1,xmin=min(data),xmax=max(data)),color="black",fill="white",alpha = 0)
+  return(d1)
+}
+
+## NOTE: Right now, derivative calculation is not working for by= factor models in gratia
+##       For interaction models, to get significant derivatives for male and female separately, we need to fit the model for male and females separately and save the derivatives.
+
+if (any(grep(x = row.names(s$s.table),pattern =  ":"))) {
+  # Male and female separately if there is an interaction in the model.
+  f<-formula(modobj$gam) # current formula
+  fterms <- terms(f)
+  fac <- attr(fterms, "factors")
+  idx <- which(as.logical(colSums(fac[grep(x=row.names(fac),pattern = "oSex"),])))
+  new_fterms <- drop.terms(fterms, dropx = idx, keep.response = TRUE)
+  new_formula <- formula(new_fterms) # Formula without any sex terms in the model.
+  malemod <- gamm(formula = new_formula,data = df,subset = oSex == "male",random=list(bblid=~1))
+  femalemod <- gamm(formula = new_formula,data = df,subset = oSex == "female",random=list(bblid=~1))
+  d1_male <- get_derivs_and_plot(modobj = malemod,low_color = "white",hi_color = male)
+  d1_female <- get_derivs_and_plot(modobj = femalemod,low_color = "white",hi_color = female)
+  #This one will be on top, so we don't need any labels, etc.
+  d1_male$theme$axis.title = element_blank()
+  d1_male$theme$axis.text.x = element_blank()
+  d1_male$theme$axis.ticks=element_blank()
+  d1_male$theme$plot.margin = unit(c(0,0,0,0),"cm")
+  d1_male$labels$fill=NULL
+  d1_female$labels$fill=NULL
+  scatter <- list(p1)
+  bar1 <- list(d1_male)
+  bar2 <- list(d1_female)
+  allplots <- c(scatter,bar1,bar2)
+  pg<-plot_grid(rel_heights = c(24,1,3),plotlist = allplots,align = "v",axis = "lr",ncol = 1)
+} else {
+  # No need to split
+  d1 <- get_derivs_and_plot(modobj = modobj)
+  scatter <- list(p1)
+  bar <- list(d1)
+  allplots <- c(scatter,bar)
+  pg<-plot_grid(rel_heights = c(8,1),plotlist = allplots,align = "v",axis = "lr",ncol = 1)
+}
+
+print(pg)
+ggsave(plot = pg,filename = gsub(x = sprintf("line_deriv_plot_%s.svg",plabels),pattern = " ",replacement = "_"),device = "svg",width = 220,height = 180,units = "mm")
+return(pg)
+}
+```
+
+
+# Load the data
+```{r load data, warning=FALSE, include=T }
+# Load the datafile
+dataFile <- "brain_iron_data.Rda"
+dataTable <- readRDS(file=dataFile)
+
+## Create the final sample
+### Remove
+### 1. Projects with incompatible data
+dataTable <- dataTable %>%
+  filter(bblid != 110689)%>%
+  filter(!(ProjectName %in% c("DAY2_808799",
+                              "FNDM1_810211",
+                              "FNDM2_810211",
+                              "NEFF_V2",
+                              "NEFF_PILOT"
+                              )
+           )
+         ) #Not using data from these projects or participants with no scans.
+### 2. Sequences with odd parameters
+dataTable <- dataTable %>%
+  filter(sequence != 'B0map_v4_matchedFOV' & sequence != "B0map") %>% # Different voxel sizes
+  filter(sequence != 'B0map_onesizefitsall_v3_T2S') %>% # small number of scans with odd params
+  filter(!is.na(GOOD)&!is.na(Putamen)) # No r2* data available or no QC possible
+#Print some info
+summaryTable<-dataTable%>%group_by(bblid,sex)%>%summarize(n=n())
+cat(sprintf('Initial sample includes:\n %d individuals aged %1.2f - %1.2f (M = %1.3f, SD = %.3f)\n (M/F = %d/%d)\n%d observations', 
+        length(unique(dataTable$bblid)),
+        min(dataTable$age,na.rm=T),
+        max(dataTable$age[dataTable$visit==1],na.rm=T),
+        mean(dataTable$age[dataTable$visit==1],na.rm=T),
+        sd(dataTable$age[dataTable$visit==1],na.rm=T),
+        sum(summaryTable$sex=='male'),
+        sum(summaryTable$sex=='female'),
+        length(dataTable$bblid)))
+### 3. Subjects that don't meet inclusion
+cat(sprintf('\nHealth exclusions: %d subs, %d scans',
+            length(unique(dataTable$bblid[dataTable$ltnExcludev2==1])),
+            sum(dataTable$ltnExcludev2==1,na.rm = T)))
+dataTable <- dataTable %>% 
+    filter(ltnExcludev2 ==0 | is.na(ltnExcludev2)) # exclude unhealthy/medicated subs
+### 4. Scans that don't pass QA
+cat(sprintf('\nQC exclusions: %d scans fail (%d pass)',
+            sum(dataTable$GOOD==0,na.rm = T),
+            sum(dataTable$GOOD %in% c("1","2"),na.rm = T)))
+dataTable <- dataTable %>%
+  filter(GOOD %in% c("1","2")) # keep only subjects that pass QA
+
+## Count visits  
+dataTable <- dataTable %>% 
+  group_by(bblid) %>% 
+  mutate(visitnum = min_rank(ScanAgeMonths)) %>%
+  ungroup()
+  dataTable$visitnum <- ordered(dataTable$visitnum)
+summaryTable<-dataTable%>%group_by(bblid,sex)%>%summarize(n=n())
+cat(sprintf('\nFinal sample includes:\n %d individuals aged %1.2f - %1.2f (M = %1.3f, SD = %.3f)\n (M/F = %d/%d)\n %d observations', 
+        length(unique(summaryTable$bblid)),
+        min(dataTable$age,na.rm=T),
+        max(dataTable$age[dataTable$visit==1],na.rm=T),
+        mean(dataTable$age[dataTable$visit==1],na.rm=T),
+        sd(dataTable$age[dataTable$visit==1],na.rm=T),
+        sum(summaryTable$sex=='male'),
+        sum(summaryTable$sex=='female'),
+        length(dataTable$bblid)))
+
+```
+
+```{r figure 1}
+# Create sample description figure (Fig 1)
+sortedBBLID<-dataTable %>% group_by(bblid) %>% summarise(m=min(age)) %>% arrange(m)
+sortedBBLID$row<-as.numeric(rownames(sortedBBLID))
+newDataTable<-dataTable%>%left_join(sortedBBLID%>%select(bblid,row),by="bblid")
+fig1<-ggplot(data = newDataTable,aes(x=reorder(row,age,FUN = min),y=age,color=oSex)) + 
+  geom_point(size=.5,alpha=.5) + geom_line(alpha=.5) +
+  scale_x_discrete(breaks = c(1,500,1000,length(sortedBBLID$bblid))) +
+  coord_flip(clip = "off") + 
+  scale_color_manual(values = c("blue","red"),labels=c("Male","Female"))+ 
+  labs(y = "Age (years)",x="Participant",color="") +theme(legend.position = c(.8,.2))
+print(fig1)
+ggsave("Fig1.svg",device = "svg",plot = fig1,width = 85,height = 85,units = "mm",bg = "transparent")
+```
+
+```{r cognition_sample}
+## make data frame for participants that have cognition data.
+behTable <- dataTable %>% 
+  filter(!is.na(NAR_Overall_Efficiency)) %>%
+  filter(scan2cnbmonths<=6)
+summaryTable<-behTable%>%group_by(bblid,sex)%>%summarize(n=n())
+cat(sprintf('\nBehavior sample includes:\n %d individuals aged %1.2f - %1.2f (M = %1.3f, SD = %.3f)\n (M/F = %d/%d)\n %d observations', 
+        length(unique(summaryTable$bblid)),
+        min(behTable$age,na.rm=T),
+        max(behTable$age[behTable$visit==1],na.rm=T),
+        mean(behTable$age[behTable$visit==1],na.rm=T),
+        sd(behTable$age[behTable$visit==1],na.rm=T),
+        sum(summaryTable$sex=='male'),
+        sum(summaryTable$sex=='female'),
+        length(behTable$bblid)))
+```
+
+### Combat harmonization
+```{r combat}
+## Combat harmonization
+# First harmonize for age models
+comtable <- dataTable %>%
+  select(Caudate,Putamen,Accumbens_Area,Pallidum,sequence,age,oSex,bblid,scanid,visitnum) %>%
+  drop_na()
+batch <- as.character(comtable$sequence)
+ctab <- t(data.matrix(comtable%>%select(Caudate,Putamen,Accumbens_Area,Pallidum)))
+g<-gamm(Putamen ~ visitnum + s(age, k = 4, fx = T) + oSex + s(age, by = oSex, k = 4, fx = T) ,data=comtable,random=list(bblid=~1))
+mod<- model.matrix(g$gam)
+combatdata <- combat(ctab,batch,mod=mod, eb = F)
+harmonized_data<-data.frame(t(combatdata$dat.combat))
+colnames(harmonized_data)<- paste(colnames(harmonized_data),"h",sep = "_")
+harmonized_data$bblid=comtable$bblid
+harmonized_data$scanid=comtable$scanid
+dataTable<- dataTable %>%
+  left_join(harmonized_data,by = c("bblid","scanid"))
+
+# Now for Behavior models
+comtable <- behTable %>%
+  select(Caudate,Putamen,Accumbens_Area,Pallidum,sequence,age,NAR_Overall_Efficiency,oSex,bblid,scanid) %>%
+  drop_na()
+batch <- as.character(comtable$sequence)
+ctab <- t(data.matrix(comtable%>%select(Caudate,Putamen,Accumbens_Area,Pallidum)))
+g<-gamm(Putamen ~ s(age, k = 4, fx = T) + s(age, by = NAR_Overall_Efficiency, k = 4, fx = T) + oSex,data=comtable,random=list(bblid=~1))
+mod<- model.matrix(g$gam)
+combatdata <- combat(ctab,batch,mod=mod, eb = F)
+harmonized_data<-data.frame(t(combatdata$dat.combat))
+colnames(harmonized_data)<- paste(colnames(harmonized_data),"h",sep = "_")
+harmonized_data$bblid=comtable$bblid
+harmonized_data$scanid=comtable$scanid
+behTable<- behTable %>%
+  left_join(harmonized_data,by = c("bblid","scanid"))
+
+longTable <- dataTable %>%
+    gather(key = "ROI",value="R2s",Accumbens_Area_h,Putamen_h,Caudate_h,Pallidum_h)
+
+rois <- c("Caudate_h","Putamen_h","Accumbens_Area_h","Pallidum_h")
+```
+
+---
+# ROI comparison
+Analyses for figure 3
+```{r roicompare,eval=T,results="asis"}
+source("/Users/larsenb/Documents/Tools/RainCloudPlots-master/tutorial_R/R_rainclouds.R") #requires RainCloud package: https://github.com/RainCloudPlots/RainCloudPlots/blob/master/tutorial_R/R_rainclouds.R
+
+longTable$ROI<-factor(longTable$ROI,levels = c("Caudate_h","Putamen_h","Accumbens_Area_h","Pallidum_h"),labels = c("Caudate","Putamen","Nucleus Accumbens","Pallidum"))
+longTable$oldROI <- c("Caudate","Putamen","Accumbens_Area","Pallidum")
+
+l<-lmerTest::lmer(R2s ~ sex+age+ROI+(1|bblid),data = longTable)
+m<-psycho::get_means(fit = l,formula="ROI")
+emmeans_table<- kable(m) %>% 
+  kable_styling(bootstrap_options = "striped",position = "left")
+print(emmeans_table)
+
+c <- psycho::get_contrasts(l,"ROI",adjust="bonf")
+contrast_table<- kable(c) %>% 
+  kable_styling(bootstrap_options = "striped",position = "left")
+print(contrast_table)
+write.csv(c,'EMMeans_contrast.csv',row.names = F)
+
+fig3<-ggplot(data=longTable,aes(x = reorder(ROI,-R2s,FUN = mean,na.rm=T),y = R2s,fill=ROI,color = ROI)) + 
+  geom_flat_violin(show.legend = F,position=position_nudge(x=.2),alpha = .4) + 
+  labs(x=NULL,y = "R2* (1/sec)",font_size=font_size) +
+  geom_point(size=.25,alpha=.4,position = position_jitter(width = .1),show.legend = F) +
+  geom_boxplot(color = "black",fill=NA,outlier.shape = NA,width=.1,show.legend = F) +
+  scale_color_brewer(palette = "Set1") + scale_fill_brewer(palette = "Set1") +
+  scale_x_discrete(labels=c("Globus\nPallidus","Nucleus\nAccumbens","Putamen","Caudate"))
+fig3
+ggsave(plot=fig3,"Fig3.svg",device = "svg",width = 85,height = 85,units = "mm",bg = "transparent")
+```
+
+# Developmental effects
+Analyses for figure 4.  
+Fit nonlinear age effect and check for age*sex interaction (factor smooth interaction: `s(age, by = oSex)`)
+oSex is Sex specified as an ordered factor to appropriately test for the interaction (female against male reference)
+```{r developmental, results="asis",eval=T,warning=F,fig.height=8,fig.width=8}
+model_formula <- "R2s ~ visitnum +oSex + oRace_bwo +s(age, k = 4, fx = T) + s(age, by = oSex, k = 4, fx = T) "
+## This will perform model testing. If the age * sex interaction is significant, it is retained, otherwise it will return an age + sex model.
+models <- longTable %>%
+    group_by(ROI)%>%
+    nest()%>%
+    mutate(results=purrr::pmap(list(data,model_formula,this_label = ROI, pbootstrap = T, longPlot = T),.f=gamm_model))
+```
+
+## Modeling of continuous*continuous interactions tests two possible models.  
+Analyses for figures 5 and 6.
+
+We compare an additive (main effects + interaction) bivariate smooth model and a varying coefficient model (details below).
+The best model is chosen via the smallest BIC.
+After the best interaction  model is selected, the significance of the interaction is tested with a parametric bootstrap likelihood ratio test. This test compares the model with the interaction term against a simpler nested model with main effects only. If the interaction model is significantly better, we keep that model. If not, the final model is the simpler model with no interaction.  
+
+### 2D smooth with additional main effects and tensor product smooth, `ti`: `ti(age) + ti(Cognition) + ti(age,Cognition)`
+
+From documentation: 
+This model specifies a main effects + interaction structure such as:
+`y ~ ti(x) + ti(z) + ti(x,z)`  
+
+`ti` is the proper way of specifying an interaction term in the context of included main effect terms:  
+
+"This functional ANOVA decomposition is supported by ti terms, which produce tensor product interactions from which the main effects have been excluded, under the assumption that they will be included separately. For example the ~ ti(x) + ti(z) + ti(x,z) would produce the above main effects + interaction structure. This is much better than attempting the same thing with s or te terms representing the interactions (although mgcv does not forbid it). Technically ti terms are very simple: they simply construct tensor product bases from marginal smooths to which identifiability constraints (usually sum-to-zero) have already been applied: correct nesting is then automatic (as with all interactions in a GLM framework). See Wood (2017, section 5.6.3)."  
+
+### Varying coefficient model (using `by =`)
+
+This will make the fit linear (rather than non-linear smooth) in the `by` variable (which is cognition in this case).
+From documentation: 
+"When using `by` with a numberic covariate, "the by argument ensures that the smooth function gets multiplied by covariate z"
+
+```{r Cognitive, results="asis",warning=F, eval = T}
+g<-gamm(NAR_Overall_Efficiency ~ s(age),data = behTable,random = list(bblid=~1))
+r <- residuals(g$gam,type = "pearson")
+behTable$Overall_Efficiency_resid <- r
+
+g<-gamm(Putamen_h ~ s(age,k=4,fx=T),data = behTable,random = list(bblid=~1))
+r <- residuals(g$gam,type = "pearson")
+behTable$Putamen_h_resid <- r
+
+# Loop over ROIs
+for (r in "Putamen_h") {
+  cat(sprintf("\n## Results for %s\n",r))
+  # Set the cognitive variables to test
+  if (r == "Putamen_h") {
+    # Overall efficiency is significant for Putamen, so check the sub-domains of efficiency as well.
+    cog_vars <- c("NAR_Overall_Efficiency",
+                  "NAR_F1_Social_Cognition_Efficiency",
+                  "NAR_F2_Complex_Reasoning_Efficiency",
+                  "NAR_F3_Executive_Efficiency",
+                  "NAR_F4_Memory_Efficiency")
+  } else{
+    cog_vars <- c("NAR_Overall_Efficiency")
+  }
+  # Loop over the cognitive variables
+  for (cv in cog_vars) {
+    cat(sprintf("\n### %s\n",cv))
+    thisTable <- behTable
+    
+    # First look at a main effects only model
+    # Fitting smooths for age and cognition
+    add_formula <- sprintf("%s ~ timepoint +oSex + s(age, k=4, fx = T) + s(%s, k=4, fx = T)",r,cv,cv)
+    gamm_model(thisTable,
+               add_formula,
+               this_label = sprintf("%s %s M.E.",r,cv),
+               smooth_var = cv,
+               group_var = "bblid",
+               pbootstrap = T,
+               model_test = F)
+    
+    # Compare the two interaction models
+    cat('\n### Comparing interaction models...\n')
+    # Bivariate interaction
+    bv_formula <- sprintf(
+      "%s ~ timepoint +oSex + ti(age, k=4, fx = T) + ti(%s, k=4, fx = T) + ti(age,%s, k=4, fx = T)",
+      r,cv,cv,cv)
+    # Linear varying coefficient interaction
+    vc_formula <- sprintf(
+      "%s ~ timepoint + oSex +s(age, k=4, fx = T) + s(age, by = %s, k=4, fx = T)",
+      r,cv)
+
+    bv <- gamm(as.formula(bv_formula),
+               random = list(bblid=~1),
+               data = thisTable)
+    vc <- gamm(as.formula(vc_formula),
+               random = list(bblid=~1),
+               data = thisTable)
+    bic<-BIC(bv$lme,vc$lme) # get BIC
+    bestmod <- gsub(row.names(bic)[which.min(bic$BIC)],pattern = "$lme",replacement = "", fixed = T) #best is min BIC
+    
+    #confirm there are no concurvity issues if the VC model is the best.
+    c<-as.data.frame(concurvity(vc$gam))
+    if (c["observed",contains(vars = names(c),"s(age):")]>.75) {
+      bestmod<-"bv"
+    }
+    switch (bestmod,
+      "bv" = {model <- bv},
+      "vc" = {model <- vc}
+    )
+
+    model_formula <- model$gam$formula
+    cat("\n\nbest model is\n",deparse(model_formula))
+
+    # Now check if the interaction is significant using parametric bootstrap `(pbootstrap=T)`
+    gamm_model(thisTable,
+               model_formula,
+               this_label = sprintf("%s %s final model",r,cv),
+               smooth_var = "age",
+               int_var = cv,
+               group_var = "bblid",
+               pbootstrap = T,
+               model_test = F)
+
+  }
+}
+```
+
+```{r 3-way interaction, results="asis",warning=F, eval = F}
+cog_vars <- c("NAR_Overall_Efficiency")
+
+for (r in rois) {
+  cat(sprintf("\n## Results for %s\n",r))
+  for (cv in cog_vars) {
+    cat(sprintf("\n### %s\n",cv))
+    thisTable <- dataTable
+
+    ## The logic here is to compare a bivariate interaction that varies by sex to a nested model that does not vary by sex
+    cat('\n### Comparing interaction models...\n')
+    # Bivariate interaction that just includes sex as a covariate
+    bv1_formula <- sprintf(
+      "%s ~ timepoint + oSex + te(age,%s, k=4, fx = T)",
+      r,cv,cv,cv)
+    # Bivariate that varies as a function of sex
+    bv2_formula <- sprintf(
+      "%s ~ timepoint + oSex + te(age,%s, k=4, fx = T) + te(age,%s, by = oSex, k=4, fx = T)",
+      r,cv,cv)
+  
+    bv1 <- gamm(as.formula(bv1_formula),
+               random = list(bblid=~1),
+               data = thisTable)
+    bv2 <- gamm(as.formula(bv2_formula),
+               random = list(bblid=~1),
+               data = thisTable)
+    bic<-BIC(bv1$lme,bv2$lme) # get BIC
+    bestmod <- gsub(row.names(bic)[which.min(bic$BIC)],pattern = "$lme",replacement = "", fixed = T) #best is min BIC
+    bestmod<-"bv2"
+    switch (bestmod,
+      "bv1" = {model <- bv1},
+      "bv2" = {model <- bv2}
+    )
+    model_formula <- model$gam$formula
+    cat(sprintf("\n\nbest model is %s\n",deparse(model_formula)))
+    a <- anova(model$gam)
+    print(kable(a$pTerms.table)%>%kable_styling(position = "left"))
+    print(kable(a$s.table)%>%kable_styling(position = "left"))
+    
+    # Now check if the interaction term from the chosen model is significant
+    gamm_model(thisTable,
+               model_formula,
+               this_label = sprintf("%s %s final model",r,cv),
+               smooth_var = "age",
+               int_var = cv,
+               group_var = "bblid",
+               pbootstrap = F,
+               model_test = F)
+  }
+}
+
+```

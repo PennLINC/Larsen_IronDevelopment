@@ -1,0 +1,8 @@
+# ignore sh autosaves and mac ._ files
+*.sh~
+._*
+
+# don't add figures and tables
+*.svg
+*.csv
+*.txt
