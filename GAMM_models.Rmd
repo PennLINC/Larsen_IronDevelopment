@@ -238,7 +238,7 @@ visualize_models <- function(modobj,smooth_var, int_var ,group_var, plabels = NU
     }
     switch (varClasses[int_var],
       "numeric" = {
-        q <- quantile(df[,int_var],probs = c(.05,.95)) #pick 10% and 90% to plot
+        q <- quantile(df[,int_var],probs = c(.05,.95)) #pick 5% and 95% to plot
         bigq <- q[[2]]
         smallq <- q[[1]]
         values <- c(bigq,smallq)
@@ -564,6 +564,7 @@ cat(sprintf('\nQC exclusions: %d scans fail (%d pass)',
             sum(dataTable$GOOD %in% c("1","2"),na.rm = T)))
 dataTable <- dataTable %>%
   filter(GOOD %in% c("1","2")) # keep only subjects that pass QA
+dataTable$acquisition = factor(dataTable$sequence,levels = c("B0map_onesizefitsall_v3", "B0map_v4","B0map_onesizefitsall_v2","b0map_v4"), labels = c("A","B","C","D"))
 
 ## Count visits  
 dataTable <- dataTable %>% 
@@ -597,6 +598,10 @@ fig1<-ggplot(data = newDataTable,aes(x=reorder(row,age,FUN = min),y=age,color=oS
   labs(y = "Age (years)",x="Participant",color="") +theme(legend.position = c(.8,.2))
 print(fig1)
 ggsave("Fig1.svg",device = "svg",plot = fig1,width = 85,height = 85,units = "mm",bg = "transparent")
+
+fig1b <- ggplot(data = dataTable, aes(x = age, color = acquisition, fill = acquisition)) + geom_histogram(alpha = .8) + scale_fill_brewer(palette = "Set1") + scale_color_brewer(palette = "Set1") + xlab("Age") + ylab("Number of Participants") + labs(fill = "Acquisition", color = "Acquisition") + scale_x_continuous(breaks = c(8,12,16,20,24)) + theme(legend.position = c(.8,.8))
+ggsave(plot=fig1b,"Fig1b.svg",device = "svg",width = 85,height = 100,units = "mm",bg = "transparent")
+
 ```
 
 ```{r cognition_sample}
@@ -661,18 +666,23 @@ rois <- c("Caudate_h","Putamen_h","Accumbens_Area_h","Pallidum_h")
 # ROI comparison
 Analyses for figure 3
 ```{r roicompare,eval=T,results="asis"}
-source("/Users/larsenb/Documents/Tools/RainCloudPlots-master/tutorial_R/R_rainclouds.R") #requires RainCloud package: https://github.com/RainCloudPlots/RainCloudPlots/blob/master/tutorial_R/R_rainclouds.R
+source("R_rainclouds.R") #requires RainCloud package: https://github.com/RainCloudPlots/RainCloudPlots/blob/master/tutorial_R/R_rainclouds.R
 
 longTable$ROI<-factor(longTable$ROI,levels = c("Caudate_h","Putamen_h","Accumbens_Area_h","Pallidum_h"),labels = c("Caudate","Putamen","Nucleus Accumbens","Pallidum"))
 longTable$oldROI <- c("Caudate","Putamen","Accumbens_Area","Pallidum")
 
-l<-lmerTest::lmer(R2s ~ sex+age+ROI+(1|bblid),data = longTable)
+longTable$num_voxels[longTable$ROI=="Caudate"] <- 132
+longTable$num_voxels[longTable$ROI=="Putamen"] <- 175
+longTable$num_voxels[longTable$ROI=="Nucleus Accumbens"] <- 19
+longTable$num_voxels[longTable$ROI=="Pallidum"] <- 58
+
+l<-lmerTest::lmer(R2s ~ sex + age + ROI + (1|bblid),data = longTable)
 m<-psycho::get_means(fit = l,formula="ROI")
 emmeans_table<- kable(m) %>% 
   kable_styling(bootstrap_options = "striped",position = "left")
 print(emmeans_table)
 
-c <- psycho::get_contrasts(l,"ROI",adjust="bonf")
+c <- psycho::get_contrasts(l,"ROI",adjust="bonf",effsize = "cohen1998")
 contrast_table<- kable(c) %>% 
   kable_styling(bootstrap_options = "striped",position = "left")
 print(contrast_table)
@@ -694,7 +704,7 @@ Analyses for figure 4.
 Fit nonlinear age effect and check for age*sex interaction (factor smooth interaction: `s(age, by = oSex)`)
 oSex is Sex specified as an ordered factor to appropriately test for the interaction (female against male reference)
 ```{r developmental, results="asis",eval=T,warning=F,fig.height=8,fig.width=8}
-model_formula <- "R2s ~ visitnum +oSex + oRace_bwo +s(age, k = 4, fx = T) + s(age, by = oSex, k = 4, fx = T) "
+model_formula <- "R2s ~ visitnum +oSex +s(age, k = 4, fx = T) + s(age, by = oSex, k = 4, fx = T) "
 ## This will perform model testing. If the age * sex interaction is significant, it is retained, otherwise it will return an age + sex model.
 models <- longTable %>%
     group_by(ROI)%>%
@@ -726,16 +736,9 @@ From documentation:
 "When using `by` with a numberic covariate, "the by argument ensures that the smooth function gets multiplied by covariate z"
 
 ```{r Cognitive, results="asis",warning=F, eval = T}
-g<-gamm(NAR_Overall_Efficiency ~ s(age),data = behTable,random = list(bblid=~1))
-r <- residuals(g$gam,type = "pearson")
-behTable$Overall_Efficiency_resid <- r
-
-g<-gamm(Putamen_h ~ s(age,k=4,fx=T),data = behTable,random = list(bblid=~1))
-r <- residuals(g$gam,type = "pearson")
-behTable$Putamen_h_resid <- r
 
 # Loop over ROIs
-for (r in "Putamen_h") {
+for (r in rois) {
   cat(sprintf("\n## Results for %s\n",r))
   # Set the cognitive variables to test
   if (r == "Putamen_h") {
@@ -861,5 +864,29 @@ for (r in rois) {
                model_test = F)
   }
 }
+
+```
+
+
+## Controlling for sequence
+
+Though data are harmonized w.r.t sequence, reviewer asked to confirm sequence does not impact results.
+
+We will test this for development and for age*Overall cogntion models.
+
+```{r sequence, results="asis",warning=F, eval = T}
+# Developmental model
+dev_formula <- "Putamen_h ~ visitnum +oSex + acquisition +s(age, k = 4, fx = T) "
+g <- gamm(as.formula(dev_formula),
+           random = list(bblid=~1),
+           data = behTable)
+anova(g$gam)
+
+# Cognitive interaction
+cog_formula <- "Putamen_h ~ timepoint + oSex + sequence +s(age, k=4, fx = T) + s(age, by = NAR_Overall_Efficiency, k=4, fx = T)"
+cog <- gamm(as.formula(cog_formula),
+           random = list(bblid=~1),
+           data = behTable)
+anova(cog$gam)
 
 ```
