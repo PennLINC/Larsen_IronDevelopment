@@ -24,6 +24,7 @@ library(broom)
 library(kableExtra)
 library(parallel)
 library(scales)
+library(emmeans) #instead of psycho
 source('combat.R')
 source('utils.R')
 font_size <- 16
@@ -669,7 +670,7 @@ Analyses for figure 3
 source("R_rainclouds.R") #requires RainCloud package: https://github.com/RainCloudPlots/RainCloudPlots/blob/master/tutorial_R/R_rainclouds.R
 
 longTable$ROI<-factor(longTable$ROI,levels = c("Caudate_h","Putamen_h","Accumbens_Area_h","Pallidum_h"),labels = c("Caudate","Putamen","Nucleus Accumbens","Pallidum"))
-longTable$oldROI <- c("Caudate","Putamen","Accumbens_Area","Pallidum")
+
 
 longTable$num_voxels[longTable$ROI=="Caudate"] <- 132
 longTable$num_voxels[longTable$ROI=="Putamen"] <- 175
@@ -677,16 +678,17 @@ longTable$num_voxels[longTable$ROI=="Nucleus Accumbens"] <- 19
 longTable$num_voxels[longTable$ROI=="Pallidum"] <- 58
 
 l<-lmerTest::lmer(R2s ~ sex + age + ROI + (1|bblid),data = longTable)
-m<-psycho::get_means(fit = l,formula="ROI")
+#m<-psycho::get_means(fit = l,formula="ROI") Psycho toolbox do longer has this function
+m <- emmeans::emmeans(l,~ROI)
 emmeans_table<- kable(m) %>% 
   kable_styling(bootstrap_options = "striped",position = "left")
 print(emmeans_table)
 
-c <- psycho::get_contrasts(l,"ROI",adjust="bonf",effsize = "cohen1998")
-contrast_table<- kable(c) %>% 
-  kable_styling(bootstrap_options = "striped",position = "left")
-print(contrast_table)
-write.csv(c,'EMMeans_contrast.csv',row.names = F)
+# c <- psycho::get_contrasts(l,"ROI",adjust="bonf",effsize = "cohen1998")
+# contrast_table<- kable(c) %>% 
+#   kable_styling(bootstrap_options = "striped",position = "left")
+# print(contrast_table)
+# write.csv(c,'EMMeans_contrast.csv',row.names = F)
 
 fig3<-ggplot(data=longTable,aes(x = reorder(ROI,-R2s,FUN = mean,na.rm=T),y = R2s,fill=ROI,color = ROI)) + 
   geom_flat_violin(show.legend = F,position=position_nudge(x=.2),alpha = .4) + 
